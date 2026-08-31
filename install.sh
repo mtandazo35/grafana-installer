@@ -8,7 +8,8 @@
 #   ./install.sh [install|uninstall] [--version X.Y.Z] [--port N] [--domain host]
 #                [--admin-pass CLAVE] [--enterprise] [--no-pin] [--force] [--check]
 #
-set -euo pipefail
+set -Eeuo pipefail
+trap 'err "Abortado en la linea ${LINENO} (codigo $?)"' ERR
 
 VERSION_DEFAULT="12.4.3"
 GRAFANA_VERSION="$VERSION_DEFAULT"
@@ -85,8 +86,30 @@ case "$HTTP_PORT" in ''|*[!0-9]*) die "--port debe ser numerico" ;; esac
 # ------------------------------------------------------------------ helpers
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# Paquete instalado, sin tuberia a `grep -q`: con `pipefail`, el escritor recibe
+# SIGPIPE cuando grep sale antes y la condicion se vuelve falsa aunque el texto
+# SI coincidiera.
+pkg_installed() {
+  case "$(dpkg-query -W -f='${Status}' "$1" 2>/dev/null || true)" in
+    *"ok installed"*) return 0 ;;
+  esac
+  return 1
+}
+
+pkg_version() { dpkg-query -W -f='${Version}' "$1" 2>/dev/null || true; }
+
+# Clave aleatoria: `head -c` cierra la tuberia y mata a `tr` con SIGPIPE, que
+# con `pipefail` + `set -e` aborta el instalador en silencio. Se lee un bloque
+# finito para que nadie escriba en una tuberia ya cerrada.
+gen_pass() {
+  local raw
+  raw="$(head -c 512 /dev/urandom | LC_ALL=C tr -cd 'A-Za-z0-9')"
+  printf '%s' "${raw:0:20}"
+}
+
 wait_apt() {
   local i=0
+  if ! have fuser; then return 0; fi
   while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
     i=$((i + 1))
     if [ "$i" -gt 60 ]; then die "apt/dpkg sigue bloqueado por otro proceso tras 5 min"; fi
@@ -148,18 +171,19 @@ run_checks() {
     local busy
     busy="$(ss -Hltnp "( sport = :${HTTP_PORT} )" 2>/dev/null || true)"
     if [ -n "$busy" ]; then
-      if echo "$busy" | grep -q grafana; then
-        ok "Puerto ${HTTP_PORT}: ocupado por Grafana (reinstalacion)"
-      else
-        err "Puerto ${HTTP_PORT} ocupado por: $(echo "$busy" | sed 's/.*users:((//; s/).*//')"
-        fail=1
-      fi
+      case "$busy" in
+        *grafana*)
+          ok "Puerto ${HTTP_PORT}: ocupado por Grafana (reinstalacion)" ;;
+        *)
+          err "Puerto ${HTTP_PORT} ocupado por: $(printf '%s' "$busy" | sed 's/.*users:((//; s/).*//')"
+          fail=1 ;;
+      esac
     else
       ok "Puerto ${HTTP_PORT} libre"
     fi
   fi
 
-  if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
+  if have fuser && fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
     warn "apt/dpkg ocupado ahora mismo (el instalador esperaria)"
   else
     ok "apt/dpkg libre"
@@ -176,8 +200,7 @@ run_checks() {
     warn "curl no instalado (el instalador lo instala)"
   fi
 
-  if dpkg-query -W -f='${Status}' grafana 2>/dev/null | grep -q "ok installed" \
-  || dpkg-query -W -f='${Status}' grafana-enterprise 2>/dev/null | grep -q "ok installed"; then
+  if pkg_installed grafana || pkg_installed grafana-enterprise; then
     warn "Grafana ya esta instalado en este host"
   fi
 
@@ -227,7 +250,13 @@ install_package() {
   local arch
   arch="$(dpkg --print-architecture)"
 
-  if apt-cache madison "$PKG" 2>/dev/null | awk -F'|' '{gsub(/ /,"",$2); print $2}' | grep -qx "$GRAFANA_VERSION"; then
+  local avail found=0 v
+  avail="$(apt-cache madison "$PKG" 2>/dev/null | awk -F'|' '{gsub(/ /,"",$2); print $2}' || true)"
+  for v in $avail; do
+    if [ "$v" = "$GRAFANA_VERSION" ]; then found=1; fi
+  done
+
+  if [ "$found" -eq 1 ]; then
     log "Instalando ${PKG}=${GRAFANA_VERSION} desde apt.grafana.com (~220 MB, tarda)..."
     wait_apt
     DEBIAN_FRONTEND=noninteractive apt-get install -y "${PKG}=${GRAFANA_VERSION}"
@@ -243,7 +272,7 @@ install_package() {
     DEBIAN_FRONTEND=noninteractive apt-get install -y "${WORKDIR}/${deb}"
     rm -f "${WORKDIR}/${deb}"
   fi
-  ok "Paquete instalado: $(dpkg-query -W -f='${Version}' "$PKG")"
+  ok "Paquete instalado: $(pkg_version "$PKG")"
 }
 
 pin_version() {
@@ -313,10 +342,13 @@ scrub_bootstrap() {
 }
 
 open_firewall() {
-  if have ufw && ufw status 2>/dev/null | grep -q "^Status: active"; then
-    ufw allow "${HTTP_PORT}/tcp" >/dev/null 2>&1 || true
-    ok "UFW activo: abierto ${HTTP_PORT}/tcp"
-  fi
+  if ! have ufw; then return 0; fi
+  case "$(ufw status 2>/dev/null || true)" in
+    *"Status: active"*)
+      ufw allow "${HTTP_PORT}/tcp" >/dev/null 2>&1 || true
+      ok "UFW activo: abierto ${HTTP_PORT}/tcp" ;;
+  esac
+  return 0
 }
 
 host_ip() {
@@ -326,8 +358,8 @@ host_ip() {
 do_install() {
   run_checks || die "Corrige lo anterior y vuelve a ejecutar (--check audita sin tocar nada)"
 
-  if dpkg-query -W -f='${Status}' "$PKG" 2>/dev/null | grep -q "ok installed" && [ "$FORCE" -eq 0 ]; then
-    warn "Grafana ya esta instalado ($(dpkg-query -W -f='${Version}' "$PKG")). No se toca nada."
+  if pkg_installed "$PKG" && [ "$FORCE" -eq 0 ]; then
+    warn "Grafana ya esta instalado ($(pkg_version "$PKG")). No se toca nada."
     warn "Usa --force para reconfigurar, o 'uninstall' para quitarlo."
     exit 0
   fi
@@ -336,7 +368,7 @@ do_install() {
   [ -f /var/lib/grafana/grafana.db ] || fresh=1
 
   if [ -z "$ADMIN_PASS" ]; then
-    ADMIN_PASS="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 20)"
+    ADMIN_PASS="$(gen_pass)"
   fi
 
   log "Instalando dependencias del instalador..."
@@ -374,7 +406,7 @@ do_install() {
 
   umask 077
   cat > "$CRED_FILE" <<CRED
-Grafana $(dpkg-query -W -f='${Version}' "$PKG") (${EDITION})
+Grafana $(pkg_version "$PKG") (${EDITION})
 Instalado: $(date -Is)
 URL:       http://$(host_ip):${HTTP_PORT}
 Usuario:   ${ADMIN_USER}
